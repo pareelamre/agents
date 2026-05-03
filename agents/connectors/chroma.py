@@ -3,8 +3,8 @@ import os
 import time
 
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import JSONLoader
 from langchain_community.vectorstores.chroma import Chroma
+from langchain_core.documents import Document
 
 from agents.polymarket.gamma import GammaMarketClient
 from agents.utils.objects import SimpleEvent, SimpleMarket
@@ -16,13 +16,33 @@ class PolymarketRAG:
         self.local_db_directory = local_db_directory
         self.embedding_function = embedding_function
 
+    def _documents_from_records(
+        self,
+        records: "list[dict]",
+        content_key: str,
+        metadata_keys: "list[str] | None" = None,
+    ) -> "list[Document]":
+        documents: list[Document] = []
+        metadata_keys = metadata_keys or []
+
+        for record in records:
+            page_content = str(record.get(content_key, ""))
+            metadata = {
+                key: record.get(key)
+                for key in metadata_keys
+                if key in record and record.get(key) is not None
+            }
+            documents.append(Document(page_content=page_content, metadata=metadata))
+
+        return documents
+
     def load_json_from_local(
         self, json_file_path=None, vector_db_directory="./local_db"
     ) -> None:
-        loader = JSONLoader(
-            file_path=json_file_path, jq_schema=".[].description", text_content=False
-        )
-        loaded_docs = loader.load()
+        with open(json_file_path, "r", encoding="utf-8") as input_file:
+            records = json.load(input_file)
+
+        loaded_docs = self._documents_from_records(records, content_key="description")
 
         embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
         Chroma.from_documents(
@@ -65,21 +85,11 @@ class PolymarketRAG:
             json.dump(dict_events, output_file)
 
         # create vector db
-        def metadata_func(record: dict, metadata: dict) -> dict:
-
-            metadata["id"] = record.get("id")
-            metadata["markets"] = record.get("markets")
-
-            return metadata
-
-        loader = JSONLoader(
-            file_path=local_file_path,
-            jq_schema=".[]",
+        loaded_docs = self._documents_from_records(
+            dict_events,
             content_key="description",
-            text_content=False,
-            metadata_func=metadata_func,
+            metadata_keys=["id", "markets"],
         )
-        loaded_docs = loader.load()
         embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
         vector_db_directory = f"{local_events_directory}/chroma"
         local_db = Chroma.from_documents(
@@ -95,28 +105,24 @@ class PolymarketRAG:
         if not os.path.isdir(local_events_directory):
             os.mkdir(local_events_directory)
         local_file_path = f"{local_events_directory}/markets.json"
+        market_records = [
+            market.dict() if hasattr(market, "dict") else market for market in markets
+        ]
         with open(local_file_path, "w+") as output_file:
-            json.dump(markets, output_file)
+            json.dump(market_records, output_file)
 
         # create vector db
-        def metadata_func(record: dict, metadata: dict) -> dict:
-
-            metadata["id"] = record.get("id")
-            metadata["outcomes"] = record.get("outcomes")
-            metadata["outcome_prices"] = record.get("outcome_prices")
-            metadata["question"] = record.get("question")
-            metadata["clob_token_ids"] = record.get("clob_token_ids")
-
-            return metadata
-
-        loader = JSONLoader(
-            file_path=local_file_path,
-            jq_schema=".[]",
+        loaded_docs = self._documents_from_records(
+            market_records,
             content_key="description",
-            text_content=False,
-            metadata_func=metadata_func,
+            metadata_keys=[
+                "id",
+                "outcomes",
+                "outcome_prices",
+                "question",
+                "clob_token_ids",
+            ],
         )
-        loaded_docs = loader.load()
         embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
         vector_db_directory = f"{local_events_directory}/chroma"
         local_db = Chroma.from_documents(
