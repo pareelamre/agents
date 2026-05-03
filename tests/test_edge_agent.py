@@ -3,6 +3,7 @@ import unittest
 from agents.custom.edge_agent import (
     MarketContextLayer,
     build_analysis_prompt,
+    build_baseline_analysis_prompt,
     extract_resolution_criteria,
     make_recommendation,
     to_market_snapshot,
@@ -129,6 +130,28 @@ class EdgeAgentTests(unittest.TestCase):
 
         self.assertIn("Context layer", prompt)
         self.assertIn("Resolve by official filing.", prompt)
+
+    def test_build_baseline_analysis_prompt_omits_context_layer(self):
+        snapshot = to_market_snapshot(
+            {
+                "id": "123",
+                "question": "Will X happen?",
+                "description": "This market will resolve to Yes if X happens.",
+                "slug": "will-x-happen",
+                "endDate": "2026-12-31T00:00:00Z",
+                "liquidity": "1000",
+                "volume": "5000",
+                "volume24hr": "100",
+                "spread": "0.01",
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.40", "0.60"]',
+            }
+        )
+
+        prompt = build_baseline_analysis_prompt("x event", snapshot)
+
+        self.assertNotIn("Context layer", prompt)
+        self.assertIn("Question: Will X happen?", prompt)
 
 
 if __name__ == "__main__":

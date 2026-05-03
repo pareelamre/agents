@@ -1,5 +1,7 @@
 .venv
 .env
+SCADSAI_API_KEY.txt
+NEWSAPI_api_key.txt
 .idea
 .ipynb_checkpoints
 .mypy_cache

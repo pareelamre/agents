@@ -7,6 +7,7 @@ import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -22,6 +23,9 @@ from openai import OpenAI
 
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 @dataclass
@@ -126,6 +130,11 @@ def parse_args() -> argparse.Namespace:
         help="OpenAI model name.",
     )
     parser.add_argument(
+        "--base-url",
+        default=os.getenv("OPENAI_BASE_URL", ""),
+        help="Optional OpenAI-compatible base URL, for example: https://llm.scads.ai/v1",
+    )
+    parser.add_argument(
         "--news-limit",
         type=int,
         default=3,
@@ -186,6 +195,21 @@ def parse_jsonish_list(value: Any) -> list[Any]:
 
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]{3,}", text.lower())
+
+
+def load_local_api_key(env_var: str, filename: str) -> str:
+    existing = clean_text(os.getenv(env_var, ""))
+    if existing:
+        return existing
+
+    candidate = REPO_ROOT / filename
+    if not candidate.exists():
+        return ""
+
+    value = clean_text(candidate.read_text(encoding="utf-8"))
+    if value:
+        os.environ[env_var] = value
+    return value
 
 
 def request_json(url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -250,8 +274,27 @@ def extract_resolution_criteria(description: str) -> str:
 
 
 def build_news_query(market: MarketSnapshot, query: str) -> str:
-    ordered_terms = list(dict.fromkeys(tokenize(query) + tokenize(market.question)))
-    return " ".join(ordered_terms[:12]) or market.question
+    cleaned_query = clean_text(query)
+    if cleaned_query:
+        return cleaned_query
+
+    stopwords = {
+        "will",
+        "what",
+        "when",
+        "where",
+        "which",
+        "before",
+        "after",
+        "happen",
+        "happens",
+        "market",
+    }
+    filtered_terms = [
+        term for term in tokenize(market.question) if term not in stopwords
+    ]
+    ordered_terms = list(dict.fromkeys(filtered_terms))
+    return " ".join(ordered_terms[:8]) or market.question
 
 
 def extract_article_with_newspaper(url: str) -> tuple[str, str]:
@@ -276,7 +319,15 @@ def extract_article_with_newspaper(url: str) -> tuple[str, str]:
     return (extracted_text, extracted_summary)
 
 
-def normalize_forecasting_summary(data: dict[str, Any]) -> ForecastingSummary:
+def normalize_forecasting_summary(data: dict[str, Any] | list[Any]) -> ForecastingSummary:
+    if isinstance(data, list):
+        data = next(
+            (item for item in data if isinstance(item, dict)),
+            {},
+        )
+    if not isinstance(data, dict):
+        data = {}
+
     return ForecastingSummary(
         predicted_future_event=clean_text(data.get("predicted_future_event", "")),
         predicted_attributes_of_future_event=[
@@ -334,13 +385,20 @@ def analyze_article_with_llm(
     market: MarketSnapshot,
     resolution_criteria: str,
     article: dict[str, str],
+    as_of: datetime | None = None,
 ) -> tuple[str, ForecastingSummary]:
+    as_of_text = (
+        f"Historical snapshot time: {as_of.isoformat()}\n"
+        if as_of is not None
+        else ""
+    )
     prompt = (
         "Analyze this article in the context of a Polymarket contract.\n"
         "Return strict JSON with keys: summary_llm, forecasting_summaries.\n"
         "forecasting_summaries must contain keys: predicted_future_event, predicted_attributes_of_future_event, "
         "genre_of_statement, credibility_of_source, conditions, rationale, modality.\n"
         "Use short strings and arrays. Do not include markdown fences.\n\n"
+        f"{as_of_text}"
         f"Market question: {market.question}\n"
         f"Market description: {market.description}\n"
         f"Resolution criteria: {resolution_criteria}\n"
@@ -370,23 +428,32 @@ def collect_news_articles(
     client: OpenAI | None,
     model: str,
     resolution_criteria: str,
+    as_of: datetime | None = None,
+    news_lookback_days: int = 30,
 ) -> list[NewsArticleContext]:
-    if limit <= 0 or not os.getenv("NEWSAPI_API_KEY"):
+    if limit <= 0:
+        return []
+
+    if not load_local_api_key("NEWSAPI_API_KEY", "NEWSAPI_api_key.txt"):
         return []
 
     from agents.connectors.news import News
 
     news_client = News()
     search_query = build_news_query(market, query)
-    start_date = (datetime.now(timezone.utc) - timedelta(days=30)).date().isoformat()
+    as_of = as_of or datetime.now(timezone.utc)
+    start_dt = as_of - timedelta(days=max(news_lookback_days, 1))
+    start_date = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    end_date = as_of.strftime("%Y-%m-%dT%H:%M:%S")
 
     try:
         response = news_client.API.get_everything(
             q=search_query,
             language=news_client.configs["language"],
             sort_by="publishedAt",
-            page_size=limit,
+            page_size=min(limit, 100),
             from_param=start_date,
+            to=end_date,
         )
     except Exception:
         return []
@@ -404,6 +471,15 @@ def collect_news_articles(
         publish_time = clean_text(raw_article.get("publishedAt", ""))
         text = clean_text(raw_article.get("content", ""))
         summary = ""
+        if publish_time:
+            try:
+                published_at_dt = datetime.fromisoformat(
+                    publish_time.replace("Z", "+00:00")
+                )
+                if published_at_dt > as_of or published_at_dt < start_dt:
+                    continue
+            except ValueError:
+                pass
 
         try:
             newspaper_text, newspaper_summary = extract_article_with_newspaper(url)
@@ -429,6 +505,7 @@ def collect_news_articles(
                     "publish_time": publish_time,
                     "text": text,
                 },
+                as_of=as_of,
             )
 
         articles.append(
@@ -456,6 +533,8 @@ def build_market_context(
     article_max_chars: int,
     client: OpenAI | None,
     model: str,
+    as_of: datetime | None = None,
+    news_lookback_days: int = 30,
 ) -> MarketContextLayer:
     resolution_criteria = extract_resolution_criteria(market.description)
     news_articles = collect_news_articles(
@@ -466,6 +545,8 @@ def build_market_context(
         client=client,
         model=model,
         resolution_criteria=resolution_criteria,
+        as_of=as_of,
+        news_lookback_days=news_lookback_days,
     )
     return MarketContextLayer(
         resolution_criteria=resolution_criteria,
@@ -582,6 +663,29 @@ def build_analysis_prompt(
     )
 
 
+def build_baseline_analysis_prompt(query: str, market: MarketSnapshot) -> str:
+    focus = query.strip() or "Find the best dry-run trade in this market."
+    return (
+        "Evaluate this binary Polymarket contract and estimate the fair probability of YES.\n"
+        "Return strict JSON with keys: probability_yes, confidence, rationale, key_drivers, risks.\n"
+        "Rules:\n"
+        "- probability_yes and confidence must be numbers between 0 and 1.\n"
+        "- key_drivers and risks must be arrays of short strings.\n"
+        "- Keep rationale under 100 words.\n"
+        "- Use the market question and description carefully.\n"
+        "- Do not include markdown fences.\n\n"
+        f"User focus: {focus}\n"
+        f"Question: {market.question}\n"
+        f"Description: {market.description}\n"
+        f"Market end date: {market.end_date}\n"
+        f"Current YES price: {market.yes_price:.3f}\n"
+        f"Current NO price: {market.no_price:.3f}\n"
+        f"Liquidity: {market.liquidity:.2f}\n"
+        f"24h volume: {market.volume_24h:.2f}\n"
+        f"Additional market context: {market.context or 'None'}\n"
+    )
+
+
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(value, upper))
 
@@ -660,6 +764,26 @@ def analyze_market(
         client=client,
         model=model,
     )
+    return analyze_market_with_context_layer(
+        client=client,
+        model=model,
+        market=market,
+        query=query,
+        min_edge=min_edge,
+        max_size=max_size,
+        context_layer=context_layer,
+    )
+
+
+def analyze_market_with_context_layer(
+    client: OpenAI,
+    model: str,
+    market: MarketSnapshot,
+    query: str,
+    min_edge: float,
+    max_size: float,
+    context_layer: MarketContextLayer,
+) -> dict[str, Any]:
     analysis = call_model(
         client=client,
         model=model,
@@ -672,6 +796,31 @@ def analyze_market(
     return {
         "market": candidate_payload(market),
         "context_layer": asdict(context_layer),
+        "analysis": analysis,
+        "recommendation": asdict(recommendation),
+    }
+
+
+def analyze_market_baseline(
+    client: OpenAI,
+    model: str,
+    market: MarketSnapshot,
+    query: str,
+    min_edge: float,
+    max_size: float,
+) -> dict[str, Any]:
+    analysis = call_model(
+        client=client,
+        model=model,
+        prompt=build_baseline_analysis_prompt(query, market),
+        system_prompt="You are a disciplined prediction-market analyst. Be concise and probabilistic.",
+    )
+    recommendation = make_recommendation(
+        market, analysis, min_edge=min_edge, max_size=max_size
+    )
+    return {
+        "market": candidate_payload(market),
+        "context_layer": asdict(MarketContextLayer(resolution_criteria="", news_articles=[])),
         "analysis": analysis,
         "recommendation": asdict(recommendation),
     }
@@ -759,7 +908,7 @@ def main() -> int:
         )
         return 1
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=args.base_url or None)
     results = [
         analyze_market(
             client=client,

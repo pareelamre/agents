@@ -1,5 +1,6 @@
 from datetime import datetime
 import os
+from pathlib import Path
 
 from newsapi import NewsApiClient
 
@@ -25,7 +26,15 @@ class News:
             "technology",
         }
 
-        self.API = NewsApiClient(os.getenv("NEWSAPI_API_KEY"))
+        api_key = os.getenv("NEWSAPI_API_KEY", "").strip()
+        if not api_key:
+            candidate = Path(__file__).resolve().parents[2] / "NEWSAPI_api_key.txt"
+            if candidate.exists():
+                api_key = candidate.read_text(encoding="utf-8").strip()
+                if api_key:
+                    os.environ["NEWSAPI_API_KEY"] = api_key
+
+        self.API = NewsApiClient(api_key)
 
     def get_articles_for_cli_keywords(self, keywords) -> "list[Article]":
         query_words = keywords.split(",")
